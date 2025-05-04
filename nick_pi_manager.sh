@@ -157,7 +157,54 @@ show_devices()  { lsusb              | less; }
 show_updates()  { apt list --upgradable 2>/dev/null | less; }
 show_logs()     { dmesg | tail -n50   | less -R; }
 show_snapshot(){ local f="$SNAPSHOT_DIR/snapshot-$(date +%Y%m%d-%H%M%S).txt"; render_menu > "$f"; echo "Snapshot saved to $f"; read -n1 -r -p "Press any key..."; }
-show_history()  { echo "History view not yet implemented."; read -n1 -r -p "Press any key..."; }
+#show_history()  { echo "History view not yet implemented."; read -n1 -r -p "Press any key..."; }
+show_history() {
+  # 1) Let user pick a window
+  echo "Select history window:"
+  echo "  1) 1 minute"
+  echo "  2) 10 minutes"
+  echo "  3) 1 hour"
+  echo "  4) 6 hours"
+  echo "  5) 12 hours"
+  echo "  6) 24 hours"
+  read -n1 -p "Choice [1-6]: " choice
+  echo
+
+  # 2) Map choice to seconds and bucket size
+  case "$choice" in
+    1) window=60    ; bs=1    ;;  # per-second
+    2) window=600   ; bs=10   ;;  # per-10sec
+    3) window=3600  ; bs=60   ;;  # per-minute
+    4) window=21600 ; bs=600  ;;  # per-10min
+    5) window=43200 ; bs=1200 ;;  # per-20min
+    6) window=86400 ; bs=3600 ;;  # per-hour
+    *) echo "Invalid choice."; read -n1 -r -p "Press any key…"; return ;;
+  esac
+
+  # 3) Compute time bounds
+  now=$(date +%s)
+  start=$(( now - window ))
+
+  # 4) Aggregate and display
+  awk -F, -v start="$start" -v bs="$bs" -v now="$now" '
+    BEGIN {
+      nb = int((now - start) / bs)
+      for(i=0; i<=nb; i++) max[i] = 0
+    }
+    $1 >= start {
+      idx = int(($1 - start) / bs)
+      if($2 > max[idx]) max[idx] = $2
+    }
+    END {
+      for(i=0; i<=nb; i++) {
+        t = start + i*bs
+        printf "%s  %4.1f%%\n", strftime("%Y-%m-%d %H:%M:%S", t), max[i]
+      }
+    }
+  ' "$LOG_FILE" | less -R
+}
+
+
 show_config()   { reset_settings; read -n1 -r -p "Press any key..."; }
 show_process_info() {
   read -p "Enter PID for details: " pid
