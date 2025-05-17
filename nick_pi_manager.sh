@@ -31,14 +31,21 @@ CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$STATE_DIR/state.yaml"
 SNAPSHOT_DIR="$STATE_DIR/snapshots"
 
+# systemd user‐unit dir (per the XDG spec)
+SYSTEMD_USER_DIR="$XDG_CONFIG_HOME/systemd/user"
+SERVICE_FILE="$SYSTEMD_USER_DIR/nick_pi_manager-log.service"
+TIMER_FILE="$SYSTEMD_USER_DIR/nick_pi_manager-log.timer"
+
 # Ensure directories & default files exist
-initialize_dirs() {
-  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$SNAPSHOT_DIR"
+initialise_dirs() {
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$SNAPSHOT_DIR" "$SYSTEMD_USER_DIR"
   touch "$CPU_LOG_FILE" "$RAM_LOG_FILE"
+
   [[ ! -f "$STATE_FILE" ]] && cat > "$STATE_FILE" <<EOF
 last_backup: {}
 seen_items: []
 EOF
+
   [[ ! -f "$CONFIG_FILE" ]] && cat > "$CONFIG_FILE" <<EOF
 cpu=true
 ram=true
@@ -48,7 +55,43 @@ cpu_log=true
 ram_log=true
 cpu_log_prune=7d
 ram_log_prune=7d
+timer_enabled=false
 EOF
+
+  # create service/timer files if missing
+  [[ ! -f "$SERVICE_FILE" ]] && cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Append CPU & RAM samples to nick_pi_manager logs
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/pi_manager --log
+EOF
+
+  [[ ! -f "$TIMER_FILE" ]] && cat > "$TIMER_FILE" <<EOF
+[Unit]
+Description=Schedule nick_pi_manager logging
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=5s
+Persistent=true
+Unit=nick_pi_manager-log.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # reload systemd so it’s aware of the new units—but don’t enable/start yet
+  systemctl --user daemon-reload
+
+  # after daemon-reload…
+if grep -q '^timer_enabled=true' "$CONFIG_FILE"; then
+  systemctl --user enable --now nick_pi_manager-log.timer
+else
+  systemctl --user disable --now nick_pi_manager-log.timer
+fi
+
 }
 
 # Load user toggles
@@ -319,7 +362,7 @@ reset_settings(){
   if [[ "$ans" =~ ^[Yy]$ ]]; then
     echo -e "${WARN_COLOR}Removing config and state...${RESET_COLOR}"
     rm -rf "$CONFIG_DIR" "$STATE_DIR"
-    initialize_dirs
+    initialise_dirs
     echo -e "${OK_COLOR}Settings have been reset to defaults.${RESET_COLOR}"
   else
     echo "Reset cancelled."
@@ -356,7 +399,7 @@ run_logger(){
 }
 
 # Entry point
-initialize_dirs
+initialise_dirs
 case "$1" in
   --reset) reset_settings;;
   --log)   run_logger;;
