@@ -53,10 +53,26 @@ disk=true
 wifi=true
 cpu_log=true
 ram_log=true
-cpu_log_prune=7d
-ram_log_prune=7d
+log_prune=7d
+log_interval=5s
 timer_enabled=false
 EOF
+
+  # Ensure all expected config keys exist (add missing with defaults)
+  ensure_config_key() {
+    local key=$1 default=$2
+    grep -q "^${key}=" "$CONFIG_FILE" || echo "${key}=${default}" >> "$CONFIG_FILE"
+  }
+
+  ensure_config_key "cpu" true
+  ensure_config_key "ram" true
+  ensure_config_key "disk" true
+  ensure_config_key "wifi" true
+  ensure_config_key "cpu_log" true
+  ensure_config_key "ram_log" true
+  ensure_config_key "log_prune" "7d"
+  ensure_config_key "log_interval" "5s"
+  ensure_config_key "timer_enabled" false
 
   # create service/timer files if missing
   [[ ! -f "$SERVICE_FILE" ]] && cat > "$SERVICE_FILE" <<EOF
@@ -68,13 +84,17 @@ Type=oneshot
 ExecStart=%h/.local/bin/pi_manager --log
 EOF
 
-  [[ ! -f "$TIMER_FILE" ]] && cat > "$TIMER_FILE" <<EOF
+  # get log interval and prune from config
+  log_interval=$(awk -F= '/^log_interval=/{print $2}' "$CONFIG_FILE")
+  log_prune=$(awk -F= '/^log_prune=/{print $2}' "$CONFIG_FILE")
+
+  cat > "$TIMER_FILE" <<EOF
 [Unit]
 Description=Schedule nick_pi_manager logging
 
 [Timer]
-OnBootSec=5s
-OnUnitActiveSec=5s
+OnCalendar=*:0/${log_interval%s}
+AccuracySec=1s
 Persistent=true
 Unit=nick_pi_manager-log.service
 
@@ -165,11 +185,30 @@ color_value() {
 
 # Render the dashboard
 render_menu() {
-  clear; load_config
-  echo -e "${DIM_COLOR}Nick Pi Manager — $(date)${RESET_COLOR}\n"
+  clear
+  load_config
+  echo -e "${DIM_COLOR}Nick Pi Manager — $(date)${RESET_COLOR}"
+
+  # show logging status
+  if systemctl --user is-active --quiet nick_pi_manager-log.timer; then
+    log_status="${OK_COLOR}ACTIVE${RESET_COLOR}"
+  else
+    log_status="${CRIT_COLOR}INACTIVE${RESET_COLOR}"
+  fi
+  echo -e "\nLogging: $log_status (every ${log_interval:-?}, kept for ${log_prune:-?})\n"
+
+  # display updates available
+  if (( update_count > 0 )); then
+    update_status="${WARN_COLOR}System and Software Updates Available: $update_count${RESET_COLOR}"
+  else
+    update_status="${OK_COLOR}System Up-to-date${RESET_COLOR}"
+  fi
+  echo -e "$update_status\n"
+
+  # diaplay main info
   printf "%-3s %-15s %-20s\n" "#" "Metric" "Value"
   local idx=1 val
-    # cors available
+  # cors available
   cores=$(get_num_cores)
   printf "%-3s %-15s %-20s\n" "$((idx++))" "Cores"      "$cores"
   [[ $cpu  == true ]] && { val=$(get_cpu_usage);    printf "%-3s %-15s %-20s\n" "$((idx++))" "CPU %"       "$(color_value $val $CPU_WARN $CPU_CRIT '%')"; }
@@ -229,8 +268,10 @@ show_history_panel() {
       1)
         if systemctl --user is-active --quiet nick_pi_manager-log.timer; then
           systemctl --user disable --now nick_pi_manager-log.timer
+          sed -i 's/^timer_enabled=true/timer_enabled=false/' "$CONFIG_FILE"
         else
           systemctl --user enable --now nick_pi_manager-log.timer
+          sed -i 's/^timer_enabled=false/timer_enabled=true/' "$CONFIG_FILE"
         fi
         ;;
       2)
@@ -275,7 +316,8 @@ pick_history_window() {
 
 # Generic history renderer
 _show_history_generic() {
-  local logfile=$1 unit=$2 now start bs nb
+  local logfile=$1 unit=$2 window=$3 bs=$4
+  local now start nb
   now=$(date +%s)
   start=$(( now - window ))
   nb=$(( (now - start) / bs ))
@@ -298,16 +340,18 @@ _show_history_generic() {
 
 show_cpu_history() {
   pick_history_window || return
-  _show_history_generic "$CPU_LOG_FILE" "% CPU"
+  _show_history_generic "$RAM_LOG_FILE" "% CPU" "$window" "$bs"
 }
 
 show_ram_history() {
   pick_history_window || return
-  _show_history_generic "$RAM_LOG_FILE" "% RAM"
+  _show_history_generic "$RAM_LOG_FILE" "% RAM" "$window" "$bs"
 }
 
+show_config()   { 
+  reset_settings; read -n1 -r -p "Press any key..."; 
+}
 
-show_config()   { reset_settings; read -n1 -r -p "Press any key..."; }
 show_process_info() {
   read -p "Enter PID for details: " pid
 
@@ -346,6 +390,8 @@ show_process_info() {
 
 # Main loop
 main_loop() {
+  # only get update count when loading up
+  update_count=$(apt list --upgradable 2>/dev/null | grep -c '\[upgradable')
   while true; do
     render_menu
     read -n1 -s choice
@@ -371,12 +417,13 @@ reset_settings(){
 
 # Logger: prune old entries & append current CPU%
 run_logger(){
+  load_config
   local prune_val prune_secs now cpu ram
 
   now=$(date +%s)
 
   if [[ "$cpu_log" == true ]]; then
-    prune_val=$(awk -F= '/cpu_log_prune/ {print $2}' "$CONFIG_FILE")
+    prune_val=$(awk -F= '/log_prune/ {print $2}' "$CONFIG_FILE")
     if [[ "$prune_val" =~ ([0-9]+)d ]]; then prune_secs=$((BASH_REMATCH[1]*86400))
     elif [[ "$prune_val" =~ ([0-9]+)h ]]; then prune_secs=$((BASH_REMATCH[1]*3600))
     else prune_secs=0; fi
@@ -387,7 +434,7 @@ run_logger(){
   fi
 
   if [[ "$ram_log" == true ]]; then
-    prune_val=$(awk -F= '/ram_log_prune/ {print $2}' "$CONFIG_FILE")
+    prune_val=$(awk -F= '/log_prune/ {print $2}' "$CONFIG_FILE")
     if [[ "$prune_val" =~ ([0-9]+)d ]]; then prune_secs=$((BASH_REMATCH[1]*86400))
     elif [[ "$prune_val" =~ ([0-9]+)h ]]; then prune_secs=$((BASH_REMATCH[1]*3600))
     else prune_secs=0; fi
@@ -399,9 +446,16 @@ run_logger(){
 }
 
 # Entry point
-initialise_dirs
 case "$1" in
-  --reset) reset_settings;;
-  --log)   run_logger;;
-  *)       main_loop;;
+  --reset)
+    initialise_dirs
+    reset_settings
+    ;;
+  --log)
+    run_logger
+    ;;
+  *)
+    initialise_dirs
+    main_loop
+    ;;
 esac
