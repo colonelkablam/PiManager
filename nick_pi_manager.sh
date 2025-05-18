@@ -36,6 +36,8 @@ SYSTEMD_USER_DIR="$XDG_CONFIG_HOME/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/nick_pi_manager-log.service"
 TIMER_FILE="$SYSTEMD_USER_DIR/nick_pi_manager-log.timer"
 
+
+
 # Ensure directories & default files exist
 initialise_dirs() {
   mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$SNAPSHOT_DIR" "$SYSTEMD_USER_DIR"
@@ -86,7 +88,6 @@ EOF
 
   # get log interval and prune from config
   log_interval=$(awk -F= '/^log_interval=/{print $2}' "$CONFIG_FILE")
-  log_prune=$(awk -F= '/^log_prune=/{print $2}' "$CONFIG_FILE")
 
   cat > "$TIMER_FILE" <<EOF
 [Unit]
@@ -147,23 +148,26 @@ get_wifi() {
 get_num_cores() {
   echo "$NUM_CORES"
 }
+# count the running processes
 get_proc_count()    { ps -e --no-headers | wc -l; }
 # Top 3 memory-hungry processes, showing PID, command & %MEM
 get_top_mem_list() {
+  local count=${1:-1}
   ps --no-headers -eo pid,%mem,comm --sort=-%mem \
-    | head -n3 \
-    | awk '{ printf "%d. %s (pid %s, %s%% mem)\n", NR, $3, $1, $2 }'
+    | head -n"$count" \
+    | awk '{ printf "%3d. %s (pid %s, %s%% mem)\n", NR, $3, $1, $2 }'
 }
 # Top 3 CPU-hungry processes, excluding the dashboard itself and the ps command,
 # showing PID, command, normalized % of total cores, and raw %CPU
 get_top_cpu_list() {
+  local count=${1:-1}
   ps --no-headers -eo pid,%cpu,comm --sort=-%cpu |
     awk -v mypid="$MYPID" '$1 != mypid && $3 != "ps"' |
-    head -n3 |
+    head -n"$count" |
     awk -v cores="$NUM_CORES" '
     {
       pct = ($2 / cores)
-      printf "%d. %s (pid %s, %.1f%% of total, %s%% raw)\n", NR, $3, $1, pct, $2
+      printf "%3d. %s (pid %s, %.1f%% of total, %s%% raw)\n", NR, $3, $1, pct, $2
     }'
 }
 
@@ -206,48 +210,47 @@ render_menu() {
   echo -e "$update_status\n"
 
   # diaplay main info
-  printf "%-3s %-15s %-20s\n" "#" "Metric" "Value"
+  printf "%3s %-15s %-20s\n" "#" "Metric" "Value"
   local idx=1 val
   # cors available
   cores=$(get_num_cores)
-  printf "%-3s %-15s %-20s\n" "$((idx++))" "Cores"      "$cores"
-  [[ $cpu  == true ]] && { val=$(get_cpu_usage);    printf "%-3s %-15s %-20s\n" "$((idx++))" "CPU %"       "$(color_value $val $CPU_WARN $CPU_CRIT '%')"; }
-  [[ $ram  == true ]] && { val=$(get_ram_usage);    printf "%-3s %-15s %-20s\n" "$((idx++))" "RAM %"       "$(color_value $val $RAM_WARN $RAM_CRIT '%')"; }
-  [[ $disk == true ]] && { val=$(get_disk_usage);   printf "%-3s %-15s %-20s\n" "$((idx++))" "Disk %"      "$(color_value $val $DISK_WARN $DISK_CRIT '%')"; }
-  [[ $wifi == true ]] && { printf "%-3s %-15s %-20s\n" "$((idx++))" "Wi-Fi"       "$(get_wifi)"; }
-  val=$(get_cpu_temp); printf "%-3s %-15s %-20s\n" "$((idx++))" "Temp (°C)"   "$(color_value $val $TEMP_WARN $TEMP_CRIT '°C')"
-  printf "%-3s %-15s %-20s\n" "$((idx++))" "Load avg"     "$(get_load_avg)"
-  printf "%-3s %-15s %-20s\n" "$((idx++))" "Uptime"       "$(get_uptime)"
-  printf "%-3s %-15s %-20s\n" "$((idx++))" "IP (wlan0)"   "$(get_ip)"
-  val=$(get_swap_usage); printf "%-3s %-15s %-20s\n" "$((idx++))" "Swap %"      "$(color_value $val 0 100 '%')"
-  val=$(get_proc_count); printf "%-3s %-15s %-20s\n" "$((idx++))" "Proc Count"   "$val"
-  # Top 3 memory processes
-  printf "%-3s %-15s %-20s\n" "$((idx++))" "Top MEM"      ""
-  while IFS= read -r line; do
-    printf "%-3s %-15s %-20s\n" "" "" "$line"
-  done < <(get_top_mem_list)
+  printf "%3s %-15s %-20s\n" "$((idx++))" "Cores"      "$cores"
+  [[ $cpu  == true ]] && { val=$(get_cpu_usage);    printf "%3s %-15s %-20s\n" "$((idx++))" "CPU %"       "$(color_value $val $CPU_WARN $CPU_CRIT '%')"; }
+  [[ $ram  == true ]] && { val=$(get_ram_usage);    printf "%3s %-15s %-20s\n" "$((idx++))" "RAM %"       "$(color_value $val $RAM_WARN $RAM_CRIT '%')"; }
+  [[ $disk == true ]] && { val=$(get_disk_usage);   printf "%3s %-15s %-20s\n" "$((idx++))" "Disk %"      "$(color_value $val $DISK_WARN $DISK_CRIT '%')"; }
+  [[ $wifi == true ]] && { printf "%3s %-15s %-20s\n" "$((idx++))" "Wi-Fi"       "$(get_wifi)"; }
+  val=$(get_cpu_temp); printf "%3s %-15s %-20s\n" "$((idx++))" "Temp (deg C)"   "$(color_value $val $TEMP_WARN $TEMP_CRIT '°C')"
+  printf "%3s %-15s %-20s\n" "$((idx++))" "Load avg"     "$(get_load_avg) (1/5/15 min per core)"
+  printf "%3s %-15s %-20s\n" "$((idx++))" "Uptime"       "$(get_uptime)"
+  printf "%3s %-15s %-20s\n" "$((idx++))" "IP (wlan0)"   "$(get_ip)"
+  val=$(get_swap_usage); printf "%3s %-15s %-20s\n" "$((idx++))" "Swap %"      "$(color_value $val 0 100 '%')"
+  # processes
+  val=$(get_proc_count)
+  printf "%3s %-15s %-20s\n" "$((idx++))" "Process Count" "$val"
+  printf "%3s %-19s %-20s\n" "" "├─ Top MEM" "$(get_top_mem_list 1)"
+  printf "%3s %-19s %-20s\n" "" "└─ Top CPU" "$(get_top_cpu_list 1)"
+  printf "%3s %-15s %-20s\n" "" "" "[M] MEM details   [C] CPU details"
 
-  # Top 3 CPU processes
-  printf "%-3s %-15s %-20s\n" "$((idx++))" "Top CPU"      ""
-  while IFS= read -r line; do
-    printf "%-3s %-15s %-20s\n" "" "" "$line"
-  done < <(get_top_cpu_list)
+  echo -e "
+  [R]efresh    [P]rocesses   [D]evices     [U]pdate List
+  [S]napshot   [L]ogging     System Lo[G]s [I]nfo
 
-  echo -e "\n[R]efresh  [P]rocesses  [D]evices  [U]pdates  [L]ogs  [S]napshot  [H]istory  [C]onfig  [I]nfo  [X]Reset  [Q]uit"
+                             [X]Reset      [Q]uit"
 }
 
 # Detailed views
 show_processes(){ ps aux --sort=-%cpu | head -n20 | less -R; }
 show_devices()  { lsusb              | less; }
 show_updates()  { apt list --upgradable 2>/dev/null | less; }
-show_logs()     { dmesg | tail -n50   | less -R; }
+show_system_logs()     { dmesg | tail -n50   | less -R; }
 show_snapshot(){ local f="$SNAPSHOT_DIR/snapshot-$(date +%Y%m%d-%H%M%S).txt"; render_menu > "$f"; echo "Snapshot saved to $f"; read -n1 -r -p "Press any key..."; }
 # Manage the logging and history views here
-show_history_panel() {
+show_logging_panel() {
   while true; do
     # Get newest values
     load_config
     clear
+    echo -e "${DIM_COLOR}📁 Logs stored in: $STATE_DIR${RESET_COLOR}"
     # detect systemd‐timer state
     if systemctl --user is-active --quiet nick_pi_manager-log.timer; then
       LOGGER_STATE="Enabled"
@@ -255,7 +258,7 @@ show_history_panel() {
       LOGGER_STATE="Disabled"
     fi
     # Display options
-    echo "📊 History Panel"
+    echo "📊 Logging and History Panel"
     echo "1) Toggle system logger (timer) (currently: $LOGGER_STATE)"
     echo "2) Toggle CPU logging (currently: $cpu_log)"
     echo "3) Toggle RAM logging (currently: $ram_log)"
@@ -340,7 +343,7 @@ _show_history_generic() {
 
 show_cpu_history() {
   pick_history_window || return
-  _show_history_generic "$RAM_LOG_FILE" "% CPU" "$window" "$bs"
+  _show_history_generic "$RAM_CPU_FILE" "% CPU" "$window" "$bs"
 }
 
 show_ram_history() {
@@ -353,8 +356,7 @@ show_config()   {
 }
 
 show_process_info() {
-  read -p "Enter PID for details: " pid
-
+  local pid="$1"
   # Make sure it exists
   if ! [[ -d "/proc/$pid" ]]; then
     echo "PID $pid does not exist."
@@ -387,6 +389,44 @@ show_process_info() {
   read -n1 -r -p "Press any key to continue…"
 }
 
+show_top_mem() {
+  while true; do
+    clear
+    echo -e "${DIM_COLOR}Top 15 Memory-Hungry Processes:${RESET_COLOR}\n"
+    get_top_mem_list 15
+    echo
+    read -n1 -p "Enter [1–15] to view process info or any other key to return: " choice
+    echo
+    if [[ "$choice" =~ ^[1-9]$|^1[0-5]$ ]]; then
+      pid=$(ps --no-headers -eo pid,%mem,comm --sort=-%mem | awk "NR==$choice {print \$1}")
+      if [[ -n "$pid" ]]; then
+        show_process_info "$pid"
+      fi
+    else
+      break
+    fi
+  done
+}
+
+show_top_cpu() {
+  while true; do
+    clear
+    echo -e "${DIM_COLOR}Top 15 CPU-Hungry Processes:${RESET_COLOR}\n"
+    get_top_cpu_list 15
+    echo
+    read -n1 -p "Enter [1–15] to view process info or any other key to return: " choice
+    echo
+    if [[ "$choice" =~ ^[1-9]$|^1[0-5]$ ]]; then
+      pid=$(ps --no-headers -eo pid,%cpu,comm --sort=-%cpu | awk "NR==$choice {print \$1}")
+      if [[ -n "$pid" ]]; then
+        show_process_info "$pid"
+      fi
+    else
+      break
+    fi
+  done
+}
+
 
 # Main loop
 main_loop() {
@@ -396,8 +436,7 @@ main_loop() {
     render_menu
     read -n1 -s choice
     case "$choice" in
-      [Rr]) ;; [Pp]) show_processes;; [Dd]) show_devices;; [Uu]) show_updates;; [Ll]) show_logs;; [Ss]) show_snapshot;; [Hh]) show_history_panel;; [Cc]) show_config;; [Ii]) show_process_info;;
-[Xx]) reset_settings;; [Qq]) echo; exit 0;; *);;
+      [Rr]) ;; [Pp]) show_processes;; [Dd]) show_devices;; [Uu]) show_updates;; [Gg]) show_system_logs;; [Ss]) show_snapshot;; [Ll]) show_logging_panel;; [Ii]) show_process_info;; [Mm]) show_top_mem;; [Cc]) show_top_cpu;; [Xx]) reset_settings;; [Qq]) echo; exit 0;; *);;
     esac
   done
 }
