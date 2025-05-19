@@ -25,24 +25,24 @@ XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 CONFIG_DIR="$XDG_CONFIG_HOME/nick_pi_manager"
 STATE_DIR="$XDG_STATE_HOME/nick_pi_manager"
-CPU_LOG_FILE="$STATE_DIR/cpu_log.csv"
-RAM_LOG_FILE="$STATE_DIR/ram_log.csv"
+LOG_DIR="$STATE_DIR/logs"
+CPU_LOG_FILE="$LOG_DIR/cpu_log.csv"
+RAM_LOG_FILE="$LOG_DIR/ram_log.csv"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$STATE_DIR/state.yaml"
 SNAPSHOT_DIR="$STATE_DIR/snapshots"
 
-# systemd user‐unit dir (per the XDG spec)
-SYSTEMD_USER_DIR="$XDG_CONFIG_HOME/systemd/user"
-SERVICE_FILE="$SYSTEMD_USER_DIR/nick_pi_manager-log.service"
-TIMER_FILE="$SYSTEMD_USER_DIR/nick_pi_manager-log.timer"
+# systemd root unit dir
+SYSTEMD_SYSTEM_DIR="/etc/systemd/system"
+SERVICE_FILE="$SYSTEMD_SYSTEM_DIR/nick_pi_manager-log.service"
+TIMER_FILE="$SYSTEMD_SYSTEM_DIR/nick_pi_manager-log.timer"
 
-
-
-# Ensure directories & default files exist
+# Ensure essential directories and configs exist
 initialise_dirs() {
-  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$SNAPSHOT_DIR" "$SYSTEMD_USER_DIR"
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" "$SNAPSHOT_DIR"
   touch "$CPU_LOG_FILE" "$RAM_LOG_FILE"
 
+  # not currently using but will for logging back-ups etc
   [[ ! -f "$STATE_FILE" ]] && cat > "$STATE_FILE" <<EOF
 last_backup: {}
 seen_items: []
@@ -75,44 +75,66 @@ EOF
   ensure_config_key "log_prune" "7d"
   ensure_config_key "log_interval" "5s"
   ensure_config_key "timer_enabled" false
+}
 
-  # create service/timer files if missing
-  [[ ! -f "$SERVICE_FILE" ]] && cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Append CPU & RAM samples to nick_pi_manager logs
-
-[Service]
-Type=oneshot
-ExecStart=%h/.local/bin/pi_manager --log
-EOF
-
-  # get log interval and prune from config
-  log_interval=$(awk -F= '/^log_interval=/{print $2}' "$CONFIG_FILE")
-
-  cat > "$TIMER_FILE" <<EOF
+# Write the .timer unit file
+generate_timer_contents() {
+  cat <<EOF
 [Unit]
 Description=Schedule nick_pi_manager logging
 
 [Timer]
-OnCalendar=*:0/${log_interval%s}
+OnBootSec=1s
+OnUnitInactiveSec=5s
 AccuracySec=1s
 Persistent=true
 Unit=nick_pi_manager-log.service
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
+  }
 
-  # reload systemd so it’s aware of the new units—but don’t enable/start yet
-  systemctl --user daemon-reload
+  # Write the .service unit file
+generate_service_contents() {
+  cat <<EOF
+[Unit]
+Description=Append CPU & RAM samples to nick_pi_manager logs
 
-  # after daemon-reload…
-if grep -q '^timer_enabled=true' "$CONFIG_FILE"; then
-  systemctl --user enable --now nick_pi_manager-log.timer
-else
-  systemctl --user disable --now nick_pi_manager-log.timer
-fi
+[Service]
+Type=oneshot
+ExecStart=/home/nickh/PiManager/nick_pi_manager.sh --log
+StandardOutput=append:$LOG_DIR/logging.out
+StandardError=append:$LOG_DIR/logging.err
+EOF
+}
 
+#ExecStart=$HOME/.local/bin/pi_manager --log
+
+
+# Creates/modifies systemd unit files only when needed
+initialise_units() {
+  local timer_changed=false service_changed=false
+
+  # Write the timer file if missing or changed
+  if [[ ! -f "$TIMER_FILE" ]] || ! diff -q <(generate_timer_contents) "$TIMER_FILE" >/dev/null; then
+    echo "Updating timer unit at $TIMER_FILE"
+    generate_timer_contents | sudo tee "$TIMER_FILE" > /dev/null
+    timer_changed=true
+  fi
+
+  # Write the service file if missing or changed
+  if [[ ! -f "$SERVICE_FILE" ]] || ! diff -q <(generate_service_contents) "$SERVICE_FILE" >/dev/null; then
+    echo "Updating service unit at $SERVICE_FILE"
+    generate_service_contents | sudo tee "$SERVICE_FILE" > /dev/null
+    service_changed=true
+  fi
+
+  # Reload systemd only if something changed
+  if [[ $timer_changed == true || $service_changed == true ]]; then
+    echo "Reloading systemd daemon..."
+    sudo systemctl daemon-reload
+  fi
 }
 
 # Load user toggles
@@ -227,8 +249,8 @@ render_menu() {
   # processes
   val=$(get_proc_count)
   printf "%3s %-15s %-20s\n" "$((idx++))" "Process Count" "$val"
-  printf "%3s %-19s %-20s\n" "" "├─ Top MEM" "$(get_top_mem_list 1)"
-  printf "%3s %-19s %-20s\n" "" "└─ Top CPU" "$(get_top_cpu_list 1)"
+  printf "%3s %-17s %-20s\n" "" "├─ Top MEM" "$(get_top_mem_list 1)"
+  printf "%3s %-17s %-20s\n" "" "└─ Top CPU" "$(get_top_cpu_list 1)"
   printf "%3s %-15s %-20s\n" "" "" "[M] MEM details   [C] CPU details"
 
   echo -e "
@@ -250,7 +272,10 @@ show_logging_panel() {
     # Get newest values
     load_config
     clear
-    echo -e "${DIM_COLOR}📁 Logs stored in: $STATE_DIR${RESET_COLOR}"
+    echo -e "${DIM_COLOR}⚙️ Config files:   $CONFIG_DIR${RESET_COLOR}"
+    echo -e "${DIM_COLOR}📁 Logs stored in: $LOG_DIR${RESET_COLOR}"
+    echo -e "${DIM_COLOR}🛠️ Timer/service files live in: $SYSTEMD_USER_DIR${RESET_COLOR}"
+    echo
     # detect systemd‐timer state
     if systemctl --user is-active --quiet nick_pi_manager-log.timer; then
       LOGGER_STATE="Enabled"
@@ -259,21 +284,24 @@ show_logging_panel() {
     fi
     # Display options
     echo "📊 Logging and History Panel"
+    echo
     echo "1) Toggle system logger (timer) (currently: $LOGGER_STATE)"
     echo "2) Toggle CPU logging (currently: $cpu_log)"
     echo "3) Toggle RAM logging (currently: $ram_log)"
     echo "4) View CPU history"
     echo "5) View RAM history"
+    echo "6) Clear CPU log"
+    echo "7) Clear RAM log"
     echo "Q) Back"
     read -n1 -p "Choice: " ch; echo
 
     case "$ch" in
       1)
-        if systemctl --user is-active --quiet nick_pi_manager-log.timer; then
-          systemctl --user disable --now nick_pi_manager-log.timer
+        if sudo systemctl is-active --quiet nick_pi_manager-log.timer; then
+          sudo systemctl disable --now nick_pi_manager-log.timer
           sed -i 's/^timer_enabled=true/timer_enabled=false/' "$CONFIG_FILE"
         else
-          systemctl --user enable --now nick_pi_manager-log.timer
+          sudo systemctl enable --now nick_pi_manager-log.timer
           sed -i 's/^timer_enabled=false/timer_enabled=true/' "$CONFIG_FILE"
         fi
         ;;
@@ -287,6 +315,18 @@ show_logging_panel() {
         source "$CONFIG_FILE";;
       4) show_cpu_history;;
       5) show_ram_history;;
+      6)
+          read -p "Are you sure you want to clear CPU log? [y/N]: " clear_cpu_log
+          if [[ "$clear_cpu_log" =~ ^[Yy]$ ]]; then
+            > "$CPU_LOG_FILE"
+          read -n1 -r -p "Log cleared, press any key..."
+          fi ;;
+      7)
+          read -p "Are you sure you want to clear RAM log? [y/N]: " clear_ram_log
+          if [[ "$clear_ram_log" =~ ^[Yy]$ ]]; then
+            > "$RAM_LOG_FILE"
+          read -n1 -r -p "Log cleared, press any key..."
+          fi ;;
       [Qq]) break;;
       *) ;;
     esac
@@ -349,10 +389,6 @@ show_cpu_history() {
 show_ram_history() {
   pick_history_window || return
   _show_history_generic "$RAM_LOG_FILE" "% RAM" "$window" "$bs"
-}
-
-show_config()   { 
-  reset_settings; read -n1 -r -p "Press any key..."; 
 }
 
 show_process_info() {
@@ -441,14 +477,46 @@ main_loop() {
   done
 }
 
+# Systemd always reflects the real config state
+apply_timer_state() {
+  if grep -q '^timer_enabled=true' "$CONFIG_FILE"; then
+    systemctl --user enable --now nick_pi_manager-log.timer
+  else
+    systemctl --user disable --now nick_pi_manager-log.timer
+  fi
+}
+
 # Reset config & state to defaults
 reset_settings(){
   read -p "Are you sure you want to reset all settings and state? [y/N]: " ans
   if [[ "$ans" =~ ^[Yy]$ ]]; then
-    echo -e "${WARN_COLOR}Removing config and state...${RESET_COLOR}"
-    rm -rf "$CONFIG_DIR" "$STATE_DIR"
+    echo -e "${WARN_COLOR}Removing config, state, and unit files...${RESET_COLOR}"
+
+    systemctl --user stop nick_pi_manager-log.timer 2>/dev/null
+    systemctl --user disable nick_pi_manager-log.timer 2>/dev/null
+
+    rm -f "$SYSTEMD_USER_DIR/timers.target.wants/nick_pi_manager-log.timer"
+    rm -f "$SERVICE_FILE" "$TIMER_FILE"
+    systemctl --user daemon-reload
+    rm -rf "$CONFIG_DIR" "$STATE_FILE"
+
+    # Do NOT delete $LOG_DIR here
     initialise_dirs
-    echo -e "${OK_COLOR}Settings have been reset to defaults.${RESET_COLOR}"
+    initialise_units
+    apply_timer_state
+    echo -e "${OK_COLOR}Settings and unit files have been reset.${RESET_COLOR}"
+    echo
+    echo -e "${WARN_COLOR}Note:${RESET_COLOR} Logging timer is currently ${CRIT_COLOR}disabled${RESET_COLOR}."
+    echo "You can re-enable it from the [L]ogging panel."
+    echo
+    read -p "Do you also want to clear all logs? [y/N]: " clear_logs
+    if [[ "$clear_logs" =~ ^[Yy]$ ]]; then
+      : > "$CPU_LOG_FILE"
+      : > "$RAM_LOG_FILE"
+      echo "Logs cleared."
+    else
+      echo "Logs preserved in: $LOG_DIR"
+    fi
   else
     echo "Reset cancelled."
   fi
@@ -456,10 +524,10 @@ reset_settings(){
 
 # Logger: prune old entries & append current CPU%
 run_logger(){
-  load_config
+  load_config # get config settings as variables
   local prune_val prune_secs now cpu ram
-
   now=$(date +%s)
+  echo "running log"
 
   if [[ "$cpu_log" == true ]]; then
     prune_val=$(awk -F= '/log_prune/ {print $2}' "$CONFIG_FILE")
@@ -487,7 +555,6 @@ run_logger(){
 # Entry point
 case "$1" in
   --reset)
-    initialise_dirs
     reset_settings
     ;;
   --log)
@@ -495,6 +562,8 @@ case "$1" in
     ;;
   *)
     initialise_dirs
+    initialise_units
+    apply_timer_state   
     main_loop
     ;;
 esac
