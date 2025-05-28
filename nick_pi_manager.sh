@@ -35,8 +35,7 @@ XDG_STATE_HOME="${XDG_STATE_HOME:-$USER_HOME/.local/state}"
 CONFIG_DIR="$XDG_CONFIG_HOME/nick_pi_manager"
 STATE_DIR="$XDG_STATE_HOME/nick_pi_manager"
 LOG_DIR="$STATE_DIR/logs"
-CPU_LOG_FILE="$LOG_DIR/cpu_log.csv"
-RAM_LOG_FILE="$LOG_DIR/ram_log.csv"
+METRICS_FILE="$LOG_DIR/metrics.csv"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$STATE_DIR/state.yaml"
 SNAPSHOT_DIR="$STATE_DIR/snapshots"
@@ -49,7 +48,7 @@ TIMER_FILE="$SYSTEMD_SYSTEM_DIR/nick_pi_manager-log.timer"
 # Ensure essential directories and configs exist
 initialise_dirs() {
   mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" "$SNAPSHOT_DIR"
-  touch "$CPU_LOG_FILE" "$RAM_LOG_FILE"
+  touch "$METRICS_FILE"
 
   # not currently using but will for logging back-ups etc
   [[ ! -f "$STATE_FILE" ]] && cat > "$STATE_FILE" <<EOF
@@ -58,15 +57,9 @@ seen_items: []
 EOF
 
   [[ ! -f "$CONFIG_FILE" ]] && cat > "$CONFIG_FILE" <<EOF
-cpu=true
-ram=true
-disk=true
-wifi=true
-cpu_log=true
-ram_log=true
 log_prune=7d
 log_interval=5s
-timer_enabled=false
+logging_timer_enabled=false
 EOF
 
   # Ensure all expected config keys exist (add missing with defaults)
@@ -74,22 +67,15 @@ EOF
     local key=$1 default=$2
     grep -q "^${key}=" "$CONFIG_FILE" || echo "${key}=${default}" >> "$CONFIG_FILE"
   }
-
-  ensure_config_key "cpu" true
-  ensure_config_key "ram" true
-  ensure_config_key "disk" true
-  ensure_config_key "wifi" true
-  ensure_config_key "cpu_log" true
-  ensure_config_key "ram_log" true
-  ensure_config_key "log_prune" "7d"
+  ensure_config_key "log_prune" "7days"
   ensure_config_key "log_interval" "5seconds"
-  ensure_config_key "timer_enabled" false
+  ensure_config_key "logging_timer_enabled" false
 }
 
 # Write the .timer unit file
 generate_timer_contents() {
   source "$CONFIG_FILE"
-  local interval="${log_interval:-5s}"
+  local interval="${log_interval:-5seconds}"
 
   cat <<EOF
 [Unit]
@@ -149,6 +135,60 @@ initialise_units() {
     echo "Reloading systemd daemon..."
     sudo systemctl daemon-reload
   fi
+}
+
+# Deploys the logrotate config for metrics.csv
+initialise_logrotate() {
+  local cfg=/etc/logrotate.d/nick_pi_manager
+  # pull in prune interval (e.g. “7days”)
+  source "$CONFIG_FILE"
+  prune_val="${log_prune:-7days}"
+  # strip the d and day  suffix to get a pure day count
+  prune_days="${prune_val%days}"
+  prune_days="${prune_days%d}"
+
+
+  # build new config in a temp file
+  local tmp
+  tmp=$(mktemp)
+  cat > "$tmp" <<EOF
+/home/${EFFECTIVE_USER}/.local/state/nick_pi_manager/logs/metrics.csv {
+    daily
+    rotate ${prune_days}
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    dateext
+    dateformat -%Y%m%d
+}
+EOF
+
+  # only overwrite if changed
+  if [[ ! -f "$cfg" ]] || ! sudo cmp -s "$tmp" "$cfg"; then
+    sudo mv "$tmp" "$cfg"
+  else
+    rm "$tmp"
+  fi
+}
+
+
+# Systemd always reflects the real config state
+apply_timer_state() {
+  if grep -q '^logging_timer_enabled=true' "$CONFIG_FILE"; then
+    sudo systemctl enable --now nick_pi_manager-log.timer
+  else
+    sudo systemctl disable --now nick_pi_manager-log.timer
+  fi
+}
+
+# setup flow
+initial_setup() {
+  initialise_dirs
+  initialise_units
+  initialise_logrotate
+  apply_timer_state
 }
 
 # Load user toggles
@@ -233,7 +273,7 @@ render_menu() {
   if sudo systemctl is-active --quiet nick_pi_manager-log.timer; then
     log_status="${OK_COLOR}ACTIVE${RESET_COLOR}"
   else
-    log_status="${CRIT_COLOR}INACTIVE${RESET_COLOR}"
+    log_status="${WARN_COLOR}INACTIVE${RESET_COLOR}"
   fi
   echo -e "\nLogging: $log_status (every ${log_interval:-?}, kept for ${log_prune:-?})\n"
 
@@ -251,10 +291,10 @@ render_menu() {
   # cors available
   cores=$(get_num_cores)
   printf "%3s %-15s %-20s\n" "$((idx++))" "Cores"      "$cores"
-  [[ $cpu  == true ]] && { val=$(get_cpu_usage);    printf "%3s %-15s %-20s\n" "$((idx++))" "CPU %"       "$(color_value $val $CPU_WARN $CPU_CRIT '%')"; }
-  [[ $ram  == true ]] && { val=$(get_ram_usage);    printf "%3s %-15s %-20s\n" "$((idx++))" "RAM %"       "$(color_value $val $RAM_WARN $RAM_CRIT '%')"; }
-  [[ $disk == true ]] && { val=$(get_disk_usage);   printf "%3s %-15s %-20s\n" "$((idx++))" "Disk %"      "$(color_value $val $DISK_WARN $DISK_CRIT '%')"; }
-  [[ $wifi == true ]] && { printf "%3s %-15s %-20s\n" "$((idx++))" "Wi-Fi"       "$(get_wifi)"; }
+  val=$(get_cpu_usage);    printf "%3s %-15s %-20s\n" "$((idx++))" "CPU %"       "$(color_value $val $CPU_WARN $CPU_CRIT '%')"; 
+  val=$(get_ram_usage);    printf "%3s %-15s %-20s\n" "$((idx++))" "RAM %"       "$(color_value $val $RAM_WARN $RAM_CRIT '%')"; 
+  val=$(get_disk_usage);   printf "%3s %-15s %-20s\n" "$((idx++))" "Disk %"      "$(color_value $val $DISK_WARN $DISK_CRIT '%')";
+  printf "%3s %-15s %-20s\n" "$((idx++))" "Wi-Fi"       "$(get_wifi)"; 
   val=$(get_cpu_temp); printf "%3s %-15s %-20s\n" "$((idx++))" "Temp (deg C)"   "$(color_value $val $TEMP_WARN $TEMP_CRIT '°C')"
   printf "%3s %-15s %-20s\n" "$((idx++))" "Load avg"     "$(get_load_avg) (1/5/15 min per core)"
   printf "%3s %-15s %-20s\n" "$((idx++))" "Uptime"       "$(get_uptime)"
@@ -285,27 +325,34 @@ show_logging_panel() {
   while true; do
     # Get newest values
     load_config
+
+    # display paths for user
     clear
-    echo -e "${DIM_COLOR}⚙️  Config files:   $CONFIG_DIR${RESET_COLOR}"
-    echo -e "${DIM_COLOR}📁 Logs files stored in: $LOG_DIR${RESET_COLOR}"
-    echo -e "${DIM_COLOR}🛠️  Timer/service files live in: $SYSTEMD_SYSTEM_DIR${RESET_COLOR}"
+    echo -e "${DIM_COLOR}⚙️  Config files:        $CONFIG_DIR${RESET_COLOR}"
+    echo -e "${DIM_COLOR}📁 Logs files:          $LOG_DIR${RESET_COLOR}"
+    echo -e "${DIM_COLOR}🛠️  Timer/service files: $SYSTEMD_SYSTEM_DIR${RESET_COLOR}"
     echo
+
     # detect systemd‐timer state
     if sudo systemctl is-active --quiet nick_pi_manager-log.timer; then
-      LOGGER_STATE="Enabled"
+      LOGGER_STATE="${OK_COLOR}Enabled${RESET_COLOR}"
     else
-      LOGGER_STATE="Disabled"
+      LOGGER_STATE="${WARN_COLOR}Disabled${RESET_COLOR}"
     fi
+
     # Display options
     echo "📊 Logging and History Panel"
     echo
-    echo "1) Toggle system logger (timer) (currently: $LOGGER_STATE)"
-    echo "2) Toggle CPU logging (currently: $cpu_log)"
-    echo "3) Toggle RAM logging (currently: $ram_log)"
-    echo "4) View CPU history"
-    echo "5) View RAM history"
-    echo "6) Clear CPU log"
-    echo "7) Clear RAM log"
+    echo -e "1) Toggle system logger state (currently: $LOGGER_STATE)"
+    echo "2) View CPU history"
+    echo "3) View RAM history"
+    echo "4) View TEMPERATURE history"
+    echo "5) View DISK SPACE history"
+    echo "6) View SWAP history"
+    echo "7) View LOAD history"
+    echo "8) View WIFI history"
+    echo "9) View ALL history"
+    echo "X) Clear log files"
     echo "Q) Back"
     read -n1 -p "Choice: " ch; echo
 
@@ -314,34 +361,26 @@ show_logging_panel() {
         if sudo systemctl is-active --quiet nick_pi_manager-log.timer; then
           echo "Disabling timer..."
           sudo systemctl disable --now nick_pi_manager-log.timer
-          sed -i 's/^timer_enabled=true/timer_enabled=false/' "$CONFIG_FILE"
+          sed -i 's/^logging_timer_enabled=true/logging_timer_enabled=false/' "$CONFIG_FILE"
         else
           echo "Enabling timer..."
           sudo systemctl enable --now nick_pi_manager-log.timer
-          sed -i 's/^timer_enabled=false/timer_enabled=true/' "$CONFIG_FILE"
+          sed -i 's/^logging_timer_enabled=false/logging_timer_enabled=true/' "$CONFIG_FILE"
         fi
         ;;
-      2)
-        # flip and immediately reload so see the new state
-        sed -i "s/^cpu_log=.*/cpu_log=$( [[ $cpu_log == true ]] && echo false || echo true )/" "$CONFIG_FILE"
-        source "$CONFIG_FILE";;
-      3)
-        # flip and immediately reload so see the new state
-        sed -i "s/^ram_log=.*/ram_log=$( [[ $ram_log == true ]] && echo false || echo true )/" "$CONFIG_FILE"
-        source "$CONFIG_FILE";;
-      4) show_cpu_history;;
-      5) show_ram_history;;
-      6)
-          read -p "Are you sure you want to clear CPU log? [y/N]: " clear_cpu_log
-          if [[ "$clear_cpu_log" =~ ^[Yy]$ ]]; then
-            > "$CPU_LOG_FILE"
-          read -n1 -r -p "Log cleared, press any key..."
-          fi ;;
-      7)
-          read -p "Are you sure you want to clear RAM log? [y/N]: " clear_ram_log
-          if [[ "$clear_ram_log" =~ ^[Yy]$ ]]; then
-            > "$RAM_LOG_FILE"
-          read -n1 -r -p "Log cleared, press any key..."
+      2) show_cpu_history;;
+      3) show_ram_history;;
+      4) show_temp_history;;
+      5) show_disk_space_history;;
+      6) show_swap_history;;
+      7) show_load_history;;
+      8) show_wifi_history;;
+      9) show_all_history;;
+      X)
+          read -p "Are you sure you want to all log files? [y/N]: " clear_logs
+          if [[ "$clear_logs" =~ ^[Yy]$ ]]; then
+            > "$METRICS_FILE"
+          read -n1 -r -p "Logs cleared, press any key..."
           fi ;;
       [Qq]) break;;
       *) ;;
@@ -399,12 +438,42 @@ _show_history_generic() {
 
 show_cpu_history() {
   pick_history_window || return
-  _show_history_generic "$CPU_CPU_FILE" "% CPU" "$window" "$bs"
+  _show_history_generic "$METRICS_FILE" "% CPU" "$window" "$bs"
 }
 
 show_ram_history() {
   pick_history_window || return
-  _show_history_generic "$RAM_LOG_FILE" "% RAM" "$window" "$bs"
+  _show_history_generic "$METRICS_FILE" "% RAM" "$window" "$bs"
+}
+
+show_temp_history() {
+  pick_history_window || return
+  _show_history_generic "$METRICS_FILE" "% TEMP" "$window" "$bs"
+}
+
+show_disk_space_history() {
+  pick_history_window || return
+  _show_history_generic "$METRICS_FILE" "% DISK" "$window" "$bs"
+}
+
+show_swap_history() {
+  pick_history_window || return
+  _show_history_generic "$METRICS_FILE" "% SWAP" "$window" "$bs"
+}
+
+show_load_history() {
+  pick_history_window || return
+  _show_history_generic "$METRICS_FILE" "% LOAD" "$window" "$bs"
+}
+
+show_wifi_history() {
+  pick_history_window || return
+  _show_history_generic "$METRICS_FILE" "% WIFI" "$window" "$bs"
+}
+
+show_wifi_history() {
+  pick_history_window || return
+  _show_history_generic "$METRICS_FILE" "% ALL" "$window" "$bs"
 }
 
 show_process_info() {
@@ -493,15 +562,6 @@ main_loop() {
   done
 }
 
-# Systemd always reflects the real config state
-apply_timer_state() {
-  if grep -q '^timer_enabled=true' "$CONFIG_FILE"; then
-    sudo systemctl enable --now nick_pi_manager-log.timer
-  else
-    sudo systemctl disable --now nick_pi_manager-log.timer
-  fi
-}
-
 # Reset config & state to defaults
 reset_settings(){
   read -p "Are you sure you want to reset all settings and state? [y/N]: " ans
@@ -527,6 +587,7 @@ reset_settings(){
 
     sudo rm -f "/etc/systemd/system/nick_pi_manager-log.timer"
     sudo rm -f "/etc/systemd/system/nick_pi_manager-log.service"
+    sudo rm -f /etc/logrotate.d/nick_pi_manager
     sudo systemctl daemon-reload
 
     rm -rf "$CONFIG_DIR" "$STATE_FILE"
@@ -547,38 +608,37 @@ reset_settings(){
   fi
 }
 
-# Logger: prune old entries & append current CPU%
+# append current metrics
 run_logger(){
+
+  # initialise_dirs/logrotate - do this 'heavy' init only in main init phase
+  # here just make sure file exist - a 'light' init
+  mkdir -p "$LOG_DIR"
+  touch "$METRICS_FILE"
+
+    # get config values
   load_config
-  local prune_val prune_secs now cpu ram
+
+  # Initialize metrics.csv with header if new or empty
+  if [[ ! -s "$METRICS_FILE" ]]; then
+    echo "timestamp,cpu,ram,temp,disk,swap,load,wifi" > "$METRICS_FILE"
+  fi 
+
   now=$(date +%s)
-  echo "Running logger"
-  echo "Saving logs to LOG_DIR = $LOG_DIR"
+  cpu=$(awk '/^cpu /{printf("%.1f",($2+$4)*100/($2+$4+$5))}' /proc/stat)
+  ram=$(free -m | awk '/Mem:/{printf("%.1f",$3*100/$2)}')
+  temp=$(awk '{print int($1/1000)}' /sys/class/thermal/thermal_zone0/temp)
+  disk=$(df / | awk 'NR==2{print int($5)}')
+  swap=$(free | awk '/Swap:/{printf("%.1f",$3*100/$2)}')
+  load=$(awk '{printf("%.2f/%.2f/%.2f",$1,$2,$3)}' /proc/loadavg)
+  wifi_dbm=$(iw dev wlan0 link 2>/dev/null|awk '/signal/{print $2}' || echo "N/A")
 
-  # if cpu being logged
-  if [[ "$cpu_log" == true ]]; then
-    prune_val=$(awk -F= '/log_prune/ {print $2}' "$CONFIG_FILE")
-    if [[ "$prune_val" =~ ([0-9]+)d ]]; then prune_secs=$((BASH_REMATCH[1]*86400))
-    elif [[ "$prune_val" =~ ([0-9]+)h ]]; then prune_secs=$((BASH_REMATCH[1]*3600))
-    else prune_secs=0; fi
-
-    tmp_cpu="$LOG_DIR/cpu_log_tmp.csv"
-    awk -F, -v now="$now" -v ps="$prune_secs" '$1>=now-ps' "$CPU_LOG_FILE" > "$tmp_cpu" && mv "$tmp_cpu" "$CPU_LOG_FILE"
-    cpu=$(awk '/^cpu /{print ($2+$4)*100/($2+$4+$5)}' /proc/stat)
-    printf "%d,%.1f\n" "$now" "$cpu" >> "$CPU_LOG_FILE"
-  fi
-
-  # if ram being logged
-  if [[ "$ram_log" == true ]]; then
-    prune_val=$(awk -F= '/log_prune/ {print $2}' "$CONFIG_FILE")
-    if [[ "$prune_val" =~ ([0-9]+)d ]]; then prune_secs=$((BASH_REMATCH[1]*86400))
-    elif [[ "$prune_val" =~ ([0-9]+)h ]]; then prune_secs=$((BASH_REMATCH[1]*3600))
-    else prune_secs=0; fi
-
-    tmp_ram="$LOG_DIR/ram_log_tmp.csv"
-    awk -F, -v now="$now" -v ps="$prune_secs" '$1>=now-ps' "$RAM_LOG_FILE" > "$tmp_ram" && mv "$tmp_ram" "$RAM_LOG_FILE"
-    ram=$(free -m | awk '/Mem:/{printf("%.1f",$3*100/$2)}')
-    printf "%d,%.1f\n" "$now" "$ram" >> "$RAM_LOG_FILE"
+  # Safely append, and catch any write errors:
+  if ! printf "%d,%.1f,%.1f,%d,%.1f,%.1f,%s,%s\n" \
+      "$now" "$cpu" "$ram" "$temp" "$disk" "$swap" "$load" "$wifi_dbm" \
+    >> "$METRICS_FILE"
+  then
+    echo "ERROR: failed to write to $METRICS_FILE" >&2
   fi
 }
 
@@ -591,10 +651,8 @@ case "$1" in
   --log)
     run_logger
     ;;
-  *)
-    initialise_dirs
-    initialise_units
-    apply_timer_state   
+  *)  
+    initial_setup
     main_loop
     ;;
 esac
