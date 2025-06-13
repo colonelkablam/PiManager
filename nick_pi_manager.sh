@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nick_pi_manager.sh — headless Pi Zero 2 W status dashboard
+# nick_pi_manager.sh — headless Pi Zero 2 W status dashboard v2
 
 ### Colour codes ###
 OK_COLOR="\e[32m"       # green
